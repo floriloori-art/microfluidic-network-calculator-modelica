@@ -205,9 +205,13 @@ class TestValve:
         )
 
     def test_open_valve_flow(self, default_valve: Valve) -> None:
-        """Test that open valve passes full flow."""
-        output = default_valve.calculate_flow()
-        assert output == default_valve.input_flow
+        """Test that open valve passes flow when pressure drop is applied."""
+        # Kv-based physics: Q = Kv · opening · sqrt(ΔP); no ΔP means no flow
+        output_zero = default_valve.calculate_flow(pressure_drop=0.0)
+        assert output_zero == 0.0
+        # With a non-zero pressure drop the valve passes flow
+        output_pos = default_valve.calculate_flow(pressure_drop=100.0)
+        assert output_pos > 0
 
     def test_closed_valve_flow(self, default_valve: Valve) -> None:
         """Test that closed valve blocks flow."""
