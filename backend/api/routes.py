@@ -74,17 +74,20 @@ def _create_element(data: ElementCreate) -> Any:
             return Pump(
                 element_id=data.element_id,
                 name=data.name,
-                area=params["area"],
-                velocity=params["velocity"],
                 pressure_generated=params["pressure_generated"],
-                resistance=params["resistance"],
+                flow_max=params.get("flow_max"),
+                resistance=params.get("resistance", 1e10),
+                area=params.get("area"),
+                velocity=params.get("velocity"),
             )
         elif data.element_type == ElementType.VALVE:
             return Valve(
                 element_id=data.element_id,
                 name=data.name,
+                kv=params.get("kv"),
+                opening=params.get("opening", 1.0),
+                state=params.get("state"),
                 input_flow=params.get("input_flow", 0.0),
-                state=params.get("state", True),
                 response_time=params.get("response_time", 1e-3),
             )
         else:

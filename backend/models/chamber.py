@@ -103,8 +103,11 @@ class Chamber(TwoPortElement):
         """
         Hydrostatic pressure at the chamber outlet:  ΔP = ρ · g · h  [Pa].
 
+        Returns 0 if height=0 (outlet at reference level).
         Used by the solver to set the absolute pressure reference at this node.
         """
+        if self.height == 0.0:
+            return 0.0
         return calculate_hydrostatic_pressure(
             self.medium.density, self.height, self.gravity
         )
@@ -120,8 +123,8 @@ class Chamber(TwoPortElement):
     # ------------------------------------------------------------------
 
     def validate_parameters(self) -> bool:
-        if self.height <= 0:
-            raise ValueError(f"Height must be positive, got {self.height}")
+        if self.height < 0:
+            raise ValueError(f"Height cannot be negative, got {self.height}")
         if self.medium.density <= 0:
             raise ValueError(f"Density must be positive, got {self.medium.density}")
         if self.gravity <= 0:
