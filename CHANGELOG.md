@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1] — 2026-04-15
+
+### Added — Nonlinear turbulent channels (Modelica two-port port)
+
+Back-port of the nonlinear channel models from the node-based backend (v0.2.0 in the legacy repo) onto the Modelica two-port architecture.
+
+#### Files
+
+- `backend/physics/flow_calculations.py` — Added `calculate_turbulent_resistance_circular` and `calculate_turbulent_resistance_rectangular`. Both use the Blasius friction factor `f = 0.316 · Re^(-0.25)` and the Darcy-Weisbach formulation `R_turb = f · L · ρ · |Q| / (2 · D · A²)`. Falls back to Hagen-Poiseuille laminar resistance for `Re < 1` to avoid unphysical values.
+- `backend/models/channel.py` — Added `NonlinearCircularChannel` and `NonlinearRectangularChannel`. Both inherit from their laminar counterparts and expose `is_nonlinear = True` (duck-typed flag the solver's Picard loop reads). Density is taken from the shared `FluidMedium` (legacy `density=` kwarg still accepted for backward compatibility). `update_resistance(flow)` re-linearises by blending laminar and turbulent resistance with a linear weight in the transition zone (Re 2300–4000).
+- `backend/solver/network_solver.py` — Generalised the solver to Picard iteration:
+  - Detects nonlinear elements via `getattr(elem, "is_nonlinear", False)`.
+  - For linear networks runs exactly one iteration (no behaviour change).
+  - For networks with nonlinear elements, wraps the linear solve in a Picard loop. After each linear solve the new flow estimate is averaged per nonlinear element and fed back via `update_resistance`.
+  - Adds **under-relaxation** `Q_eff = α · Q_new + (1-α) · Q_prev` (default α = 0.5) to damp the R(|Q|) oscillations inherent to Blasius-type turbulent models.
+  - Convergence check on relative resistance change (default tol = 1e-6, max 30 iterations).
+  - `element_results` now includes `reynolds` for nonlinear elements.
+- `backend/tests/test_nonlinear_channels.py` — **New**: 25 tests covering laminar/turbulent/transition regimes, Blasius correlation analytically verified, Picard convergence, Reynolds reporting, legacy `(viscosity, density)` constructor API and serialisation round-trip.
+
+### Design decisions
+
+- **Two-port refactor for nonlinear channels** — the nonlinear classes live in the Modelica TwoPortElement hierarchy (not the legacy node base) and use the shared `FluidMedium` for both viscosity and density. The legacy `(viscosity=, density=)` kwargs are preserved as a backward-compat wrapper so existing callers keep working.
+- **Under-relaxation in the Picard loop** — without relaxation, `R(|Q|) ∝ |Q|^0.75` causes oscillations at high Reynolds (R swings between 10⁴ and 10¹⁰). α = 0.5 converges reliably within ~10 iterations for the tested cases.
+- **Linear networks unaffected** — the Picard loop reduces to a single pass when no element carries the `is_nonlinear` flag, so all 133 existing tests pass unchanged.
+
+### Test coverage
+
+158/158 unit tests passing (133 existing + 25 new nonlinear-channel tests).
+
+---
+
 ## [0.3.0] — 2026-04-15
 
 ### Added — 3D CAD Import (STEP/IGES)

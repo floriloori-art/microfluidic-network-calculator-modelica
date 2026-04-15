@@ -61,17 +61,39 @@ class NetworkSolver:
         self,
         max_iterations: int = 1000,
         tolerance: float = 1e-10,
+        nonlinear_iterations: int = 30,
+        nonlinear_tolerance: float = 1e-6,
+        nonlinear_relaxation: float = 0.5,
     ) -> None:
         """Initialize the network solver.
 
         Args:
-            max_iterations: Maximum solver iterations (default: 1000).
-            tolerance: Convergence tolerance (default: 1e-10).
+            max_iterations: Maximum solver iterations for the linear system
+                (default: 1000).
+            tolerance: Convergence tolerance for the linear system
+                (default: 1e-10).
+            nonlinear_iterations: Maximum Picard iterations for networks
+                containing flow-dependent (nonlinear) elements (default: 30).
+            nonlinear_tolerance: Relative tolerance on effective resistance
+                change between Picard iterations (default: 1e-6).
+            nonlinear_relaxation: Under-relaxation factor α in
+                ``Q_eff = α · Q_new + (1-α) · Q_prev`` used to damp Picard
+                oscillations on strongly nonlinear elements (default: 0.5,
+                valid range (0, 1]; 1.0 = no relaxation).
         """
+        if not (0.0 < nonlinear_relaxation <= 1.0):
+            raise ValueError(
+                f"nonlinear_relaxation must be in (0, 1], got {nonlinear_relaxation}"
+            )
         self.max_iterations = max_iterations
         self.tolerance = tolerance
+        self.nonlinear_iterations = nonlinear_iterations
+        self.nonlinear_tolerance = nonlinear_tolerance
+        self.nonlinear_relaxation = nonlinear_relaxation
         logger.info(
-            f"NetworkSolver initialized (max_iter={max_iterations}, tol={tolerance})"
+            f"NetworkSolver initialized (max_iter={max_iterations}, tol={tolerance}, "
+            f"nl_iter={nonlinear_iterations}, nl_tol={nonlinear_tolerance}, "
+            f"nl_relax={nonlinear_relaxation})"
         )
 
     def solve(
@@ -107,107 +129,193 @@ class NetworkSolver:
         # Carry over any validation warnings (INFO/WARNING messages)
         pre_solve_messages: list[str] = validation_result.messages
 
-        # Get node list and build matrices
+        # Get node list and build index
         nodes = list(network.elements.keys())
         n_nodes = len(nodes)
         node_index = {node: i for i, node in enumerate(nodes)}
 
-        # Build conductance matrix (G = 1/R)
-        G = np.zeros((n_nodes, n_nodes))
-        for src, tgt in network.connections:
-            i, j = node_index[src], node_index[tgt]
-            elem_src = network.elements[src]
-            elem_tgt = network.elements[tgt]
+        # Identify flow-dependent (nonlinear) elements (e.g. turbulent channels)
+        nonlinear_elems: dict[str, Any] = {
+            eid: elem
+            for eid, elem in network.elements.items()
+            if getattr(elem, "is_nonlinear", False)
+        }
+        has_nonlinear = bool(nonlinear_elems)
 
-            # Conductance for series connection: G = 1 / (R_src + R_tgt)
-            r_src = elem_src.calculate_resistance()
-            r_tgt = elem_tgt.calculate_resistance()
-            conductance = 1.0 / (r_src + r_tgt)
-
-            G[i, j] -= conductance
-            G[j, i] -= conductance
-            G[i, i] += conductance
-            G[j, j] += conductance
-
-        # Build source vector (for pressure sources like pumps)
-        b = np.zeros(n_nodes)
-
-        # Apply boundary conditions
+        # Collect boundary conditions (shared across iterations)
         known_pressures: dict[str, float] = {}
         known_flows: dict[str, float] = {}
-
         for elem_id, bc in boundary_conditions.items():
             if elem_id not in node_index:
                 logger.warning(f"Boundary condition element '{elem_id}' not in network")
                 continue
-
             if "pressure" in bc:
                 known_pressures[elem_id] = bc["pressure"]
             if "flow" in bc:
                 known_flows[elem_id] = bc["flow"]
 
         # Handle pumps as pressure sources (Dirichlet BC at pump node)
-        # A pump maintains its generated pressure at its outlet node.
         for elem_id, element in network.elements.items():
             if isinstance(element, Pump):
                 known_pressures[elem_id] = element.pressure_generated
 
-        # Modify system for known pressures (Dirichlet BCs)
-        for elem_id, pressure in known_pressures.items():
-            i = node_index[elem_id]
-            # Zero out row and set diagonal to 1
-            G[i, :] = 0
-            G[i, i] = 1
-            b[i] = pressure
-
-        # Solve linear system
-        try:
-            pressures_array = linalg.solve(G, b)
-            success = True
-            residual = float(np.linalg.norm(G @ pressures_array - b))
-        except linalg.LinAlgError as e:
-            logger.error(f"Solver failed: {e}")
-            return SolverResult(
-                success=False,
-                messages=[f"Linear algebra error: {e}"],
-            )
-
-        # Build pressure dictionary
-        pressures = {nodes[i]: float(pressures_array[i]) for i in range(n_nodes)}
-
-        # Calculate flows through each connection
+        # ── Picard iteration loop for nonlinear elements ─────────────────
+        # For purely linear networks this runs exactly once.
+        max_nl_iter = self.nonlinear_iterations if has_nonlinear else 1
+        alpha = self.nonlinear_relaxation  # under-relaxation factor
+        prev_resistances: dict[str, float] = {}
+        prev_element_q: dict[str, float] = {eid: 0.0 for eid in nonlinear_elems}
+        pressures: dict[str, float] = {}
         flows: dict[tuple[str, str], float] = {}
-        for src, tgt in network.connections:
-            i, j = node_index[src], node_index[tgt]
-            dp = pressures[src] - pressures[tgt]
+        residual: float = 0.0
+        converged_nl = True
+        nl_iter = 0
+        picard_messages: list[str] = []
 
-            elem_src = network.elements[src]
-            elem_tgt = network.elements[tgt]
-            r_total = elem_src.calculate_resistance() + elem_tgt.calculate_resistance()
+        for nl_iter in range(max_nl_iter):
+            # Build conductance matrix (G = 1/R) using current resistances
+            G = np.zeros((n_nodes, n_nodes))
+            for src, tgt in network.connections:
+                i, j = node_index[src], node_index[tgt]
+                elem_src = network.elements[src]
+                elem_tgt = network.elements[tgt]
 
-            flow = dp / r_total
-            flows[(src, tgt)] = flow
+                r_src = elem_src.calculate_resistance()
+                r_tgt = elem_tgt.calculate_resistance()
+                conductance = 1.0 / (r_src + r_tgt)
+
+                G[i, j] -= conductance
+                G[j, i] -= conductance
+                G[i, i] += conductance
+                G[j, j] += conductance
+
+            # Build source vector
+            b = np.zeros(n_nodes)
+
+            # Apply Dirichlet BCs
+            for elem_id, pressure in known_pressures.items():
+                i = node_index[elem_id]
+                G[i, :] = 0
+                G[i, i] = 1
+                b[i] = pressure
+
+            # Solve linear system
+            try:
+                pressures_array = linalg.solve(G, b)
+                residual = float(np.linalg.norm(G @ pressures_array - b))
+            except linalg.LinAlgError as e:
+                logger.error(f"Solver failed: {e}")
+                return SolverResult(
+                    success=False,
+                    messages=pre_solve_messages + [f"Linear algebra error: {e}"],
+                )
+
+            # Build pressure dictionary
+            pressures = {nodes[i]: float(pressures_array[i]) for i in range(n_nodes)}
+
+            # Calculate flows through each connection
+            flows = {}
+            for src, tgt in network.connections:
+                dp = pressures[src] - pressures[tgt]
+                elem_src = network.elements[src]
+                elem_tgt = network.elements[tgt]
+                r_total = elem_src.calculate_resistance() + elem_tgt.calculate_resistance()
+                flows[(src, tgt)] = dp / r_total
+
+            # If no nonlinear elements, single iteration is enough
+            if not has_nonlinear:
+                break
+
+            # ── Update nonlinear elements with new flow estimates ──
+            # Average the flows going into and out of each nonlinear element
+            # to get a representative Q through the element.
+            element_flows: dict[str, list[float]] = {eid: [] for eid in nonlinear_elems}
+            for (src, tgt), q in flows.items():
+                if src in element_flows:
+                    element_flows[src].append(abs(q))
+                if tgt in element_flows:
+                    element_flows[tgt].append(abs(q))
+
+            # Snapshot resistances before update for convergence check
+            current_resistances = {
+                eid: elem.calculate_resistance()
+                for eid, elem in nonlinear_elems.items()
+            }
+
+            # Re-linearise each nonlinear element with under-relaxation on Q
+            # to damp Picard oscillations: Q_eff = α·Q_new + (1-α)·Q_prev
+            for eid, elem in nonlinear_elems.items():
+                q_list = element_flows[eid]
+                avg_q = sum(q_list) / len(q_list) if q_list else 0.0
+                q_eff = alpha * avg_q + (1.0 - alpha) * prev_element_q[eid]
+                elem.update_resistance(q_eff)
+                prev_element_q[eid] = q_eff
+
+            # Check convergence (relative change in resistances)
+            if prev_resistances:
+                max_rel_change = 0.0
+                for eid, elem in nonlinear_elems.items():
+                    r_new = elem.calculate_resistance()
+                    r_prev = prev_resistances[eid]
+                    if r_prev > 0:
+                        rel = abs(r_new - r_prev) / r_prev
+                        max_rel_change = max(max_rel_change, rel)
+                if max_rel_change < self.nonlinear_tolerance:
+                    converged_nl = True
+                    picard_messages.append(
+                        f"Picard converged after {nl_iter + 1} iteration(s) "
+                        f"(max rel change: {max_rel_change:.2e})"
+                    )
+                    break
+            prev_resistances = {
+                eid: elem.calculate_resistance()
+                for eid, elem in nonlinear_elems.items()
+            }
+        else:
+            # for-else: executed only if loop exhausted without break
+            if has_nonlinear:
+                converged_nl = False
+                picard_messages.append(
+                    f"WARNING: Picard did not converge in {max_nl_iter} iterations"
+                )
+
+        success = converged_nl
 
         # Build detailed element results
         element_results = self._build_element_results(network, pressures, flows)
 
+        # Add Reynolds number to element_results for nonlinear channels
+        for eid, elem in nonlinear_elems.items():
+            if eid in element_results:
+                q_list = [abs(q) for (s, t), q in flows.items() if s == eid or t == eid]
+                avg_q = sum(q_list) / len(q_list) if q_list else 0.0
+                if hasattr(elem, "get_reynolds"):
+                    element_results[eid]["reynolds"] = elem.get_reynolds(avg_q)
+
         # Verify mass conservation
         conservation_error = self._check_mass_conservation(network, flows)
 
-        messages = pre_solve_messages + [f"Solver converged with residual: {residual:.2e}"]
+        messages = (
+            pre_solve_messages
+            + picard_messages
+            + [f"Solver converged with residual: {residual:.2e}"]
+        )
         if conservation_error > self.tolerance:
             messages.append(
                 f"WARNING: Mass conservation error: {conservation_error:.2e}"
             )
 
-        logger.info(f"Solver completed: success={success}, residual={residual:.2e}")
+        logger.info(
+            f"Solver completed: success={success}, residual={residual:.2e}, "
+            f"nl_iterations={nl_iter + 1}"
+        )
 
         return SolverResult(
             success=success,
             pressures=pressures,
             flows=flows,
             element_results=element_results,
-            iterations=1,  # Direct solver
+            iterations=nl_iter + 1,
             residual=residual,
             messages=messages,
         )

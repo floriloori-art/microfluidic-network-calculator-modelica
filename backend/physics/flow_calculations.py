@@ -283,6 +283,92 @@ def calculate_pressure_drop(
     return flow_rate * resistance
 
 
+def calculate_turbulent_resistance_circular(
+    radius: float,
+    length: float,
+    viscosity: float,
+    density: float,
+    flow_rate: float,
+) -> float:
+    """Calculate turbulent hydraulic resistance for circular channel.
+
+    Uses Darcy-Weisbach with Blasius friction factor (smooth pipe):
+
+        f = 0.316 · Re^(-0.25)       (valid for 4000 < Re < 10^5)
+        ΔP = f · (L / D) · (ρ v² / 2)
+        R_turb = ΔP / Q = f · L · ρ · |Q| / (2 · D · A²)
+
+    Args:
+        radius: Channel radius [m].
+        length: Channel length [m].
+        viscosity: Dynamic viscosity [Pa·s].
+        density: Fluid density [kg/m³].
+        flow_rate: Current volumetric flow rate [m³/s] (absolute value used).
+
+    Returns:
+        Turbulent hydraulic resistance [Pa·s/m³].
+
+    Note:
+        For Re < 1 or very small flow, falls back to laminar Poiseuille
+        resistance to avoid division by zero / unphysical values.
+    """
+    D = 2.0 * radius
+    A = PI * radius ** 2
+    Q_abs = abs(flow_rate)
+
+    if Q_abs < 1e-30:
+        return calculate_resistance_circular(radius, length, viscosity)
+
+    v = Q_abs / A
+    Re = density * v * D / viscosity
+
+    if Re < 1.0:
+        return calculate_resistance_circular(radius, length, viscosity)
+
+    f = 0.316 * Re ** (-0.25)
+    return f * length * density * Q_abs / (2.0 * D * A ** 2)
+
+
+def calculate_turbulent_resistance_rectangular(
+    width: float,
+    height: float,
+    length: float,
+    viscosity: float,
+    density: float,
+    flow_rate: float,
+) -> float:
+    """Calculate turbulent hydraulic resistance for rectangular channel.
+
+    Uses hydraulic diameter D_h = 2·w·h / (w + h) and Blasius friction.
+
+    Args:
+        width: Channel width [m].
+        height: Channel height [m].
+        length: Channel length [m].
+        viscosity: Dynamic viscosity [Pa·s].
+        density: Fluid density [kg/m³].
+        flow_rate: Current volumetric flow rate [m³/s] (absolute value used).
+
+    Returns:
+        Turbulent hydraulic resistance [Pa·s/m³].
+    """
+    A = width * height
+    D_h = 2.0 * width * height / (width + height)
+    Q_abs = abs(flow_rate)
+
+    if Q_abs < 1e-30:
+        return calculate_resistance_rectangular(width, height, length, viscosity)
+
+    v = Q_abs / A
+    Re = density * v * D_h / viscosity
+
+    if Re < 1.0:
+        return calculate_resistance_rectangular(width, height, length, viscosity)
+
+    f = 0.316 * Re ** (-0.25)
+    return f * length * density * Q_abs / (2.0 * D_h * A ** 2)
+
+
 def _validate_positive(value: float, name: str) -> None:
     """Validate that a value is strictly positive.
 
